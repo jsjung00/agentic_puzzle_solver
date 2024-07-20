@@ -4,4 +4,6 @@ TODO steps
 
 - [] Figure out how to get multion account
 - [] Write code to connect to the website
+- [] Define the multi-step algorithm
+- 
   
