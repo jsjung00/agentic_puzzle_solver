@@ -27,3 +27,5 @@ TODO steps
 - [] Need to prompt optimize to not return incorrect things
 
 Plan: read a little bit for motivation. Then, use the dude's tool. Then try using other models (sonnet)
+
+# Multi-step reasoning with LLMs. Using NYT connections as testbed
