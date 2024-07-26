@@ -1,4 +1,4 @@
-from model import Jury
+from model import Jury, Debate
 import pdb 
 
 def test_jury():
@@ -6,5 +6,11 @@ def test_jury():
     jury = Jury()
     verdict = jury.group_judge(plan)
 
+def test_debate():
+    words = ["WAX", "MUMMY", "GIFT", "ANCHOR", "BURRITO", "PRESENT", "CLAY", "PAPYRUS", "SPRAIN", "FLAIR", "MODERATE", "TALENT", "INSTINCT", "PARCHMENT", "HOST", "FACULTY"]
+    debater = Debate(words, num_rounds=2, num_agents=3)
+    pdb.set_trace()
+    agent_contexts = debater.driver()
 if __name__ == "__main__":
-    test_jury()
+    #test_jury()
+    test_debate()
