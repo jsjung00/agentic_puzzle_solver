@@ -79,10 +79,10 @@ class Debate:
             "groups you have created, putting your answer in the form "
             "**group name**: [word_one, word_two, word_three, word_four]"
         )
-        context = [
+  
+        agent_contexts = [[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": question}]
-        agent_contexts = [context for _ in range(self.num_agents)]
+                {"role": "user", "content": question}] for _ in range(self.num_agents)]
 
         for round in range(self.num_rounds):
             for i, agent_context in enumerate(agent_contexts):
