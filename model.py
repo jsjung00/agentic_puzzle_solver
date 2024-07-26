@@ -10,6 +10,97 @@ import math
 from constants import incorrect_json_str, plan_generator_system_prompt, replan_generator_system_prompt
 
 load_dotenv()
+
+'''
+Some notes from the debate paper: https://openreview.net/pdf?id=zj7YuTE4t8#page=12&zoom=100,409,81
+    - Add a longer debate prompt
+    - Use number of debate rounds 3 or larger
+    - Use up to 5 debate agents (start with 3)
+    - Add the other people's reasoning to the history 
+'''
+
+class Debate:
+    '''
+    Conducts a debate and returns a set of groups of size 4 based on the current
+        available words
+    '''
+    def __init__(self, available_words: list[str], num_rounds:int, num_agents:int):
+        self.available_words = available_words
+        self.num_rounds = num_rounds
+        self.num_agents = num_agents
+        self.client = OpenAI()
+
+    def construct_assistant_msg(self, completion):
+        content = completion.choices[0].message.content
+        return {"role": "assistant", "content": content}
+    
+    def generate_answer(self, answer_context):
+        completion = self.client.chat.completions.create(
+            model="gpt-4o",
+            messages=answer_context)
+        return completion
+
+    def construct_message(self, agent_contexts_other, question, idx):
+        '''
+        Creates a message to reflect on other agents explanation and answer. 
+            If no other agents, then creates a message for self reflection
+        '''
+        if len(agent_contexts_other) == 0:
+            return {"role": "user", "content": """Please double check if your solution is correct. Look through the group of words created and their corresponding group themes and see if the group words match the theme.
+                    Put your final solution with the groups and themes you have created in the form **group name**: [word_one, word_two, word_three, word_four"""}
+        
+        prefix_string = "These are the solutions and solution explanations to the Connections puzzle from other agents: "
+        for agent_context in agent_contexts_other:
+            #TODO: need to use 4o-mini to extract solution and summarize reasoning from word spillage and format. 
+            agent_response = agent_context[idx]["content"]
+            response = f"\n\n One agent solution: ```{agent_response}```"
+            prefix_string += response 
+        
+        prefix_string += """\n\n Using the reasoning from other agents as additional advice, can you give an updated answer? Examine your solution and that of other agents step by step. Put your solution with the groups and themes you have created in the form **group name**: [word_one, word_two, word_three, word_four"""
+        return {"role": "user", "content": prefix_string}
+                    
+
+    def driver(self): 
+        system_prompt = """You are a NYT Connections solver. As a reminder,
+        The NYT Connections game is a word puzzle where players are given a grid of 16 words and must categorize them into four groups of four words each.
+        The main rules include: 
+        1. **Grid Structure**: The game presents 16 words arranged in a 4x4 grid.
+        2. **Grouping**: Players need to identify four distinct groups of four words that share a common theme or category. Each group must consist of exactly four words.
+        3. **Word Usage**: Each word can only belong to one group. 
+        4. **Winning the Game**: The goal is to correctly group all 16 words into the four categories. 
+        
+        You will be given the list of remaining words on the grid and your job is to follow the rules and create
+        groups to solve the game."""
+
+        question = (
+            f"The available words are {self.available_words}. Can you solve the NYT "
+            "Connections puzzle by creating groups of four words that share a common "
+            "theme or category. Deliberate and then explain the reasoning behind the "
+            "groups you have created, putting your answer in the form "
+            "**group name**: [word_one, word_two, word_three, word_four]"
+        )
+        context = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}]
+        agent_contexts = [context for _ in range(self.num_agents)]
+
+        for round in range(self.num_rounds):
+            for i, agent_context in enumerate(agent_contexts):
+                if round > 0:
+                    agent_contexts_other = agent_contexts[:i] + agent_contexts[i+1:]
+                    message = self.construct_message(agent_contexts_other, question, 2*round)
+                    agent_context.append(message)
+                
+                completion = self.generate_answer(agent_context)
+                assistant_msg = self.construct_assistant_msg(completion)
+                agent_context.append(assistant_msg)
+                print(f'Round {round + 1} Agent {i + 1}: {assistant_msg['content']}')
+
+        return agent_contexts
+
+        
+
+
 #TODO: use different model types 
 class Jury:
     def __init__(self, num_judges=3):
