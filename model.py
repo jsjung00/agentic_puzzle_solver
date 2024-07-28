@@ -5,11 +5,308 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import json 
 import pdb 
-from collections import defaultdict
+from collections import defaultdict, Counter
 import math 
+import numpy as np 
 from constants import incorrect_json_str, plan_generator_system_prompt, replan_generator_system_prompt
+import copy 
+import agentops
+import os
 
 load_dotenv()
+agentops.init(os.environ['AGENT_OPS_KEY'])
+
+
+
+class Orchestrator:
+    '''
+    Generates the responses from the agents after debate, verifies and does feedback, ranks the outputs, generates a list of groups to try
+        and it executes action 
+    '''
+    def __init__(self, remaining_words, groups_correct:int, failed_groups: list[str]):
+        self.remaining_words = remaining_words
+        self.groups_correct = groups_correct
+        self.debater = Debate(self.remaining_words, num_rounds=2, num_agents=3)
+        self.failed_groups = failed_groups
+
+        self.ranked_solutions = [] # list of dicts where key is rank and value is group 
+        self.used_words = set() #keeps track of words that have been succesfully submitted 
+        self.ranked_groups = []
+    
+    def ret_ranked_groups(self):
+        '''
+        Returns a sorted list of groups, sorted by the groups with most votes across solutions, ties broken by rank 
+        '''
+        # TODO: change the hash to tuple, alphabetically sorted
+        # get number votes of each group
+        num_votes = defaultdict(int)
+        
+        ranks = defaultdict(list) # index is list of words converted to string using '#'.join
+        for i in range(0, len(self.ranked_solutions)):
+            sol = self.ranked_solutions[i]
+            for rank, group_words in sol.items():
+                group_key = tuple(sorted(group_words)) #key is tuple of group set (alpha sorted for order invariance)
+                ranks[group_key].append(int(rank))
+                num_votes[group_key] += 1
+
+        # get average rank of each group   
+        avg_ranks = {} #key: group_hash, val: avg_rank
+        for group_hash, ranks in ranks.items():
+            avg_ranks[group_hash] = float(np.mean(ranks))
+
+
+        group_items = [] #(group_hash, num_votes, avg_rank)
+        for group_hash in num_votes.keys():
+            group_list = list(group_hash)
+            votes = num_votes[group_hash]
+            avg_rank = avg_ranks[group_hash]
+
+            group_items.append((group_list, votes, avg_rank))
+
+        sorted_group_items = sorted(group_items, key=lambda x: (-x[1], x[2])) #sort first by num votes, then avg_rank
+        self.ranked_groups = [tup[0] for tup in sorted_group_items]
+        return self.ranked_groups
+
+    def get_next_group(self):
+        # return first group that does not use already used words 
+        for group in self.ranked_groups:
+            if len(set(group) & self.used_words) == 0:
+                return group 
+        
+        raise ValueError("No groups that don't include some of the used words")
+        return 
+
+    def update_used_words(self, words: list[str]):
+        for word in words:
+            self.used_words.add(word)
+        
+        return 
+
+    def run_round(self):
+        '''
+        Executes a round. Returns (list of successful groups, failed group if exists)
+        '''
+        successful_groups = [] 
+        all_sols_valid = False 
+        self.debater.update_failed_groups(self.failed_groups)
+        list_sols = self.debater.driver()
+
+        # continues to generate responses until satisfies all the rules 
+        while (all_sols_valid == False):
+            verifier = Verifier(list_sols, self.remaining_words)
+            are_sols_valid = verifier.ret_solutions_valid()
+            if not all(are_sols_valid):
+                # update the solutions for the ones that failed
+                for i in range(0, len(are_sols_valid)):
+                    if not are_sols_valid[i]:
+                        context = self.debater.agent_contexts[i].copy()
+                        if len(self.failed_groups):
+                            context.append({'user': f"Also use the fact that the incorrect groups of words are {self.failed_groups}"})
+                        correction_prompt = verifier.correction_prompts[i]
+    
+                        model = Model('gpt-4o',history=context)
+                        text_response = model.forward(correction_prompt)
+                        list_sols[i] = self.debater.get_json_puzzle_solution(text_response)
+            
+            all_sols_valid = all(are_sols_valid)            
+        
+        ranker = Ranker(list_sols)
+        ranked_sols = ranker.rank_solutions()
+        self.ranked_solutions = ranked_sols
+
+        ranked_groups = self.ret_ranked_groups() #TODO: FIX: SHOULD BE MORE THAN 4
+        self.ranked_groups = ranked_groups
+
+        result = True
+        while(result):
+            if self.groups_correct >= 4: break 
+
+            next_group = self.get_next_group()
+            result = self.execute_group(next_group)
+            if result:
+                successful_groups.append(next_group)
+                self.update_used_words(next_group)
+                self.groups_correct += 1
+            
+            self.ranked_groups.remove(next_group)
+
+        if self.groups_correct >= 4:
+            return successful_groups, None 
+    
+        return successful_groups, next_group 
+
+
+    def execute_group(self, group):
+        # Returns boolean if group was successful
+        def get_result(group_words):
+            print(group_words)
+            user_input = input("Was it succeed, Y or N: ")
+            return True if user_input == "Y" or user_input == "y" else False 
+        
+        return get_result(group)
+
+
+
+
+
+
+class Model:
+    def __init__(self, model_name:str, base_prompt='You are a helpful assistant.', history=None):
+        self.model_name = model_name
+        if 'gpt' in model_name:
+            self.client = OpenAI()
+        assert 'gpt' in model_name
+
+        if history:
+            self.history = history 
+        else:
+            self.history = [{"role": "system", "content": base_prompt}]
+
+
+    def forward(self, prompt=None, json_mode=False):
+        '''
+        Calls model and returns output 
+        '''
+        if prompt:
+            self.history.append({"role": "user", "content": prompt})
+        
+        if json_mode:
+            completion = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=self.history,
+            response_format={ "type": "json_object" })
+        else:
+            completion = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=self.history)
+        content = completion.choices[0].message.content
+        self.history.append({"role": "assistant", "content": content})
+
+        return content 
+
+class Ranker:
+    '''
+    Takes in a list of solutions and returns a list of solution where each solution has the groups ranked
+    '''
+    def __init__(self, list_solutions):
+        '''
+        list_solutions: List[Dict], Dict is {theme: group_words_list}
+        '''
+        system_prompt = "You are an expert NYT Connections solver. You will be given some candidate solution of categories and their groups of words. Please rank the groups by your confidence on the correctness of the group, with 1 being the most confident."
+        self.list_solutions = list_solutions
+        self.model = Model("gpt-4o", system_prompt)
+    
+    def rank_solution(self, solution):
+        '''
+        Ranks solution and returns a string with ranked groups in content 
+
+        solution: Dict (key: group theme, val: List[str])
+        '''
+        prompt = f"Solution: {solution}"
+        response = self.model.forward(prompt)
+
+        return response 
+
+    def shape_json(self):
+        '''
+        Takes string from rank_solution and returns Dict where key is the rank (confidence rank, 1 highest) and value is a (key: group theme, group_words: List[str])
+        '''
+        prompt = f'''Please convert your previous response with the ranked groups into a json format.
+        You are to return a JSON object where the key is the rank [1-4] and the value is the corresponding group of words.
+        
+        Example: {{1: ["CAMPAIGN", "CANVASS", "ORGANIZE", "STUMP"], 2: ["COMPOSITION", "FABRIC", "MAKEUP", "STRUCTURE"], 3:["CLAMP", "FILE", "LEVEL", "SAW"], 4:["LOG", "MAX", "MOD", "TAN"]}}'''
+        json_response = self.model.forward(prompt, json_mode=True)
+        ranked_solution = json.loads(json_response)
+        return ranked_solution 
+
+
+    def rank_solutions(self):
+        '''
+        Returns a list of dictionaries where the key is the confidence rank and the val is the group of words 
+        '''
+        ranked_solutions = []
+        for i in range(0, len(self.list_solutions)):
+            sol = self.list_solutions[i]
+            _ = self.rank_solution(sol)
+            ranked_solutions.append(self.shape_json())
+
+        return ranked_solutions
+
+
+class Verifier:
+    '''
+    Takes in a list of dictionaries which each holds groups of size 4 and their their themes
+        and verifies that they satisfy the rules.
+    '''
+    def __init__(self, list_solutions, available_words: list[str]):
+        '''
+        list_solutions: List[Dict], Dict is {theme: group_words_list}
+        available_words: list[str] words to create groups with
+        '''
+        self.list_solutions = list_solutions 
+        self.solutions_valid = [] #list of booleans corresponding to whether the solution is valid
+        self.correction_prompts = ['' for _ in range(len(self.list_solutions))]
+        self.available_words = available_words
+
+    def check_disjoint_sets(self, list_of_sets):
+        for i in range(len(list_of_sets)):
+            for j in range(i + 1, len(list_of_sets)):
+                if list_of_sets[i] & list_of_sets[j]:  # Check for intersection
+                    return False
+        return True
+
+    def is_solution_valid(self, solution):
+        '''
+        Returns boolean if solution (i.e all groups in dict) are valid, correction prompt string (can be empty if correct)
+        
+        solution: (Dict)
+        '''
+        # check number of groups
+        if len(list(solution.values())) != len(self.available_words) // 4:
+            print("Incorrect number of groups")
+            return False, f"The solution you returned has an incorrect number of groups. The remaining words {self.available_words} has {len(self.available_words)} words and so should have {len(self.available_words)//4} groups. Please reflect on this and create a new solution."
+        # check number of words 
+        for group in list(solution.values()):
+            if len(group) != 4:
+                print("Incorrect number of words in a group")
+                return False, f"The solution must return groups of four words. Your solution contains a group {group} with {len(group)} words. Please reflect and create a new solution."
+        #check if words come from available words
+        for group in list(solution.values()):
+            for word in group:
+                if word not in self.available_words:
+                    print("Incorrect words chosen")
+                    return False, f"The solution must return groups of four words that come from the set of available words {self.available_words}. Your solution contains a group {group} with a word that is not in the set of available words. Please reflect and create a new solution."
+        #check if no groups share a word
+        list_group_sets = [set(group) for group in list(solution.values())]
+        all_disjoint = self.check_disjoint_sets(list_group_sets)
+        if not all_disjoint:
+            print(f"Groups {list_group_sets} are not disjoint")
+            return False, f"The solution must use the available words and partition them into groups of four words that do not share a word with any other group. Your solution has groups that share words. Please reflect on this and create a new solution."
+
+        return True, ""
+        
+    def ret_solutions_valid(self):
+        '''
+        Returns a list of booleans on whether agent solution is correct 
+            Also updates self.correction_prompts
+        '''
+        for i in range(0, len(self.list_solutions)):
+            sol = self.list_solutions[i]
+            is_valid, prompt_str = self.is_solution_valid(sol)
+            self.correction_prompts[i] = prompt_str
+            self.solutions_valid.append(is_valid)
+
+        return self.solutions_valid
+    
+
+
+
+
+
+
+
+
+
 
 '''
 Some notes from the debate paper: https://openreview.net/pdf?id=zj7YuTE4t8#page=12&zoom=100,409,81
@@ -21,7 +318,7 @@ Some notes from the debate paper: https://openreview.net/pdf?id=zj7YuTE4t8#page=
 
 class Debate:
     '''
-    Conducts a debate and returns a set of groups of size 4 based on the current
+    Conducts a debate and returns a list of dictionaries which each hold groups of size 4 and their themes based on the current
         available words
     '''
     def __init__(self, available_words: list[str], num_rounds:int, num_agents:int):
@@ -29,6 +326,11 @@ class Debate:
         self.num_rounds = num_rounds
         self.num_agents = num_agents
         self.client = OpenAI()
+        self.agent_contexts = []
+        self.failed_groups = [] #list of group words that failed
+
+    def update_failed_groups(self, failed_groups):
+        self.failed_groups = failed_groups
 
     def construct_assistant_msg(self, completion):
         content = completion.choices[0].message.content
@@ -60,25 +362,43 @@ class Debate:
         return {"role": "user", "content": prefix_string}
                     
 
-    def driver(self): 
-        system_prompt = """You are a NYT Connections solver. As a reminder,
-        The NYT Connections game is a word puzzle where players are given a grid of 16 words and must categorize them into four groups of four words each.
-        The main rules include: 
-        1. **Grid Structure**: The game presents 16 words arranged in a 4x4 grid.
-        2. **Grouping**: Players need to identify four distinct groups of four words that share a common theme or category. Each group must consist of exactly four words.
-        3. **Word Usage**: Each word can only belong to one group. 
-        4. **Winning the Game**: The goal is to correctly group all 16 words into the four categories. 
-        
-        You will be given the list of remaining words on the grid and your job is to follow the rules and create
-        groups to solve the game."""
+    def ret_agent_contexts(self): 
+        if len(self.available_words) == 16:
+            system_prompt = """You are a NYT Connections solver. As a reminder,
+            The NYT Connections game is a word puzzle where players are given a grid of 16 words and must categorize them into four groups of four words each.
+            The main rules include: 
+            1. **Grid Structure**: The game presents 16 words arranged in a 4x4 grid.
+            2. **Grouping**: Players need to identify four distinct groups of four words that share a common theme or category. Each group must consist of exactly four words.
+            3. **Word Usage**: Each word can only belong to one group. 
+            4. **Winning the Game**: The goal is to correctly group all 16 words into the four categories. 
+            
+            You will be given the list of remaining words on the grid. You may also be given a list of groups of four words
+            that have failed and are incorrect. Your job is to use this information, follow the rules, and create
+            groups to solve the game.
+            """
+        else:
+            system_prompt = """You are an expert NYT Connections solver. You will be given the list of remaining words on the grid. You may also be given a list of groups of four words
+            that have been tried and are incorrect. Your job is to use this information, follow the rules, and create
+            groups from the list of remaining words to solve the game.
+            """
 
-        question = (
+        if self.failed_groups:
+            question = (
+            f"The available words are {self.available_words}. The groups of words that are incorrect are {self.failed_groups}."
+            "Can you solve the NYT "
+            "Connections puzzle by creating groups of four words that share a common "
+            "theme or category. Deliberate and then explain the reasoning behind the "
+            "groups you have created, putting your answer in the form "
+            "**group name**: [word_one, word_two, word_three, word_four]"
+            )
+        else:
+            question = (
             f"The available words are {self.available_words}. Can you solve the NYT "
             "Connections puzzle by creating groups of four words that share a common "
             "theme or category. Deliberate and then explain the reasoning behind the "
             "groups you have created, putting your answer in the form "
             "**group name**: [word_one, word_two, word_three, word_four]"
-        )
+        )        
   
         agent_contexts = [[
                 {"role": "system", "content": system_prompt},
@@ -94,9 +414,56 @@ class Debate:
                 completion = self.generate_answer(agent_context)
                 assistant_msg = self.construct_assistant_msg(completion)
                 agent_context.append(assistant_msg)
+                #TODO: send generation content to backend to show on webapp
+                #print(f'Round {round + 1} Agent {i + 1}')
                 print(f'Round {round + 1} Agent {i + 1}: {assistant_msg['content']}')
 
         return agent_contexts
+
+    def get_json_puzzle_solution(self, response: str):
+        system_prompt = (
+            "You are a helpful agent. You will be given a response by another GPT agent that "
+            "consists of a solution to the NYT Connections puzzle and their explanation for it. "
+            "Please extract the solution, which are the lists of words in the group and their category theme, "
+            "and return a JSON object where the keys represent the category themes and the values represent the corresponding list of four words that fit the category.\n"
+            "For example:\n"
+            "{\n"
+            '    "WAYS TO SUPPORT A CANDIDATE": ["CAMPAIGN", "CANVASS", "ORGANIZE", "STUMP"],\n'
+            '    "CONSTITUTION": ["COMPOSITION", "FABRIC", "MAKEUP", "STRUCTURE"],\n'
+            '    "CARPENTRY TOOLS": ["CLAMP", "FILE", "LEVEL", "SAW"],\n'
+            '    "MATH ABBREVIATIONS": ["LOG", "MAX", "MOD", "TAN"]\n'
+            "}"
+        )
+        user_prompt = f"GPT response: {response}"
+        history = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        response = self.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=history,
+            response_format={ "type": "json_object" },
+        )
+        response_msg = response.choices[0].message.content
+        response = json.loads(response_msg)
+        return response 
+
+    
+    def driver(self):
+        '''
+        Returns the list of dictionaries representing agent solutions; each dict has key: group_theme and val: list of group words
+        '''
+        agent_contexts = self.ret_agent_contexts()
+        self.agent_contexts = agent_contexts
+        list_solutions = [] # contains solutions represented as dicts with key: group theme and val: list of group words
+        for i in range(0, len(agent_contexts)):
+            last_response = agent_contexts[i][-1]['content']
+            response_dict = self.get_json_puzzle_solution(last_response)
+            list_solutions.append(response_dict)
+        
+        return list_solutions
+
+
 
         
 
@@ -366,9 +733,6 @@ class Replanner:
 
         return plan 
        
-    
-
-    
     def driver(self):
         generated_result = None
         while(generated_result is None):

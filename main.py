@@ -2,7 +2,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import json 
 import pdb 
-from model import Replanner
+from model import Replanner, Orchestrator, Debate, Verifier, Ranker
 
 '''
 '''
@@ -13,8 +13,12 @@ class Engine:
         self.groups_correct = 0
         self.num_mistakes = 0
         self.remaining_words = all_words
-        self.planner = Replanner(self.remaining_words)
+        self.failed_groups = []
     
+    def update_remaining_words(self, success_group: list[str]):
+        new_remaining_words = [word for word in self.remaining_words if word not in success_group]
+        self.remaining_words = new_remaining_words
+
     def execute_plan(self, plan):
         # Returns a list of idxs of success groups
         # plan: List[Dict[str: List[str]]] each object is {category_theme: [words]}
@@ -72,10 +76,22 @@ class Engine:
     
     def main(self):
         while(self.groups_correct < 4 and self.num_mistakes < 4):
-            generated_plan = self.planner.driver()
-            success_group_idxs = self.execute_plan(generated_plan)
-            self.update_state(generated_plan, success_group_idxs)
-        
+            # generate the list of groups to try 
+            orchestrator = Orchestrator(self.remaining_words, self.groups_correct, self.failed_groups)
+
+            groups_solved, failed_group = orchestrator.run_round()
+            if failed_group:
+                self.failed_groups.append(failed_group)
+
+            # update available words
+            for group in groups_solved:
+                self.update_remaining_words(group)
+
+            self.groups_correct += len(groups_solved)
+
+            if self.groups_correct < 4:
+                self.num_mistakes += 1
+
         if self.groups_correct == 4:
             print("Congratulations! You solved the puzzle.")
         else:
@@ -89,5 +105,4 @@ class Engine:
 if __name__ == "__main__":
     words = ["WAX", "MUMMY", "GIFT", "ANCHOR", "BURRITO", "PRESENT", "CLAY", "PAPYRUS", "SPRAIN", "FLAIR", "MODERATE", "TALENT", "INSTINCT", "PARCHMENT", "HOST", "FACULTY"]
     game_engine = Engine(words)
-    pdb.set_trace()
     game_engine.main()
